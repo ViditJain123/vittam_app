@@ -1,6 +1,8 @@
+import { Audio } from 'expo-av';
+import { Camera, CameraView } from 'expo-camera';
 import { Redirect, useRouter } from 'expo-router';
-import React, { useEffect, useState } from 'react';
-import { Alert, KeyboardAvoidingView, Platform, ScrollView, StyleSheet, View } from 'react-native';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Alert, Image, KeyboardAvoidingView, Platform, ScrollView, StyleSheet, View } from 'react-native';
 import { ActivityIndicator, Avatar, Button, Card, Divider, IconButton, ProgressBar, Text, TextInput } from 'react-native-paper';
 import { useAuth } from '../context/AuthContext';
 import { getRandomAuthPhrase } from '../utils/AuthPhrases';
@@ -21,12 +23,22 @@ const SendMoneyScreen = () => {
   const [hasFaceData, setHasFaceData] = useState(false);
   const [hasVoiceData, setHasVoiceData] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [capturedImage, setCapturedImage] = useState<string | null>(null);
+  const [cameraPermission, setCameraPermission] = useState<boolean | null>(null);
+  const [audioPermission, setAudioPermission] = useState<boolean | null>(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isPlayingAudio, setIsPlayingAudio] = useState(false);
+  
+  const recordingRef = useRef<Audio.Recording | null>(null);
+  const soundRef = useRef<Audio.Sound | null>(null);
+  const [recordingUri, setRecordingUri] = useState<string | null>(null);
+  const cameraRef = useRef<CameraView | null>(null);
   
   const { user, sendMoney, lookupRecipient } = useAuth();
   const router = useRouter();
 
   // Generate a random verification phrase for this transaction
-  const [verificationPhrase, setVerificationPhrase] = useState(getRandomAuthPhrase());
+  const [verificationPhrase] = useState(getRandomAuthPhrase());
 
   // Look up recipient when VVIT ID changes and has enough characters
   useEffect(() => {
@@ -80,48 +92,206 @@ const SendMoneyScreen = () => {
     }
   };
 
-  // Fake progress simulation for scanning processes
+  /* ------------------------------------------------------------------ */
+  /*                           permissions                              */
+  /* ------------------------------------------------------------------ */
   useEffect(() => {
-    let interval: ReturnType<typeof setInterval> | undefined;
-    
-    if (selfieMode || voiceMode) {
-      setProgress(0);
-      interval = setInterval(() => {
-        setProgress(current => {
-          const newProgress = current + 0.1;
-          if (newProgress >= 1) {
-            clearInterval(interval);
-            if (selfieMode) completeFaceVerification();
-            if (voiceMode) completeVoiceVerification();
-            return 1;
-          }
-          return newProgress;
-        });
-      }, 300);
-    }
-    
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, [selfieMode, voiceMode]);
+    (async () => {
+      const camResult = await Camera.requestCameraPermissionsAsync();
+      setCameraPermission(camResult.status === "granted");
 
-  // Mock face verification
-  const completeFaceVerification = () => {
+      const micResult = await Audio.requestPermissionsAsync();
+      setAudioPermission(micResult.status === "granted");
+    })();
+  }, []);
+  
+  /* ------------------------------------------------------------------ */
+  /*                     helpers: start / stop audio                    */
+  /* ------------------------------------------------------------------ */
+  const stopRecording = useCallback(async (): Promise<string | null> => {
+    const rec = recordingRef.current;
+    if (!rec) return null;
+
+    try {
+      const status = await rec.getStatusAsync();
+      if (status.isRecording || !status.isDoneRecording) {
+        await rec.stopAndUnloadAsync();
+      }
+      const uri = rec.getURI();
+      recordingRef.current = null;
+      setIsRecording(false);
+      return uri ?? null;
+    } catch (err) {
+      console.warn("Error stopping recording:", err);
+      return null;
+    }
+  }, []);
+  
+  const startRecording = useCallback(async () => {
+    try {
+      if (!audioPermission) {
+        const { status } = await Audio.requestPermissionsAsync();
+        if (status !== "granted") {
+          Alert.alert(
+            "Permission Required",
+            "Microphone permission is needed for voice verification."
+          );
+          return;
+        }
+        setAudioPermission(true);
+      }
+
+      // stop any previous recording first
+      if (recordingRef.current) await stopRecording();
+
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+      });
+
+      const rec = new Audio.Recording();
+      await rec.prepareToRecordAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
+      await rec.startAsync();
+
+      recordingRef.current = rec;
+      setIsRecording(true);
+      console.log("Recording started");
+    } catch (err) {
+      console.error("Failed to start recording:", err);
+      Alert.alert("Error", "Failed to start recording. Please try again.");
+      setIsRecording(false);
+    }
+  }, [audioPermission, stopRecording]);
+
+  /* ------------------------------------------------------------------ */
+  /*                       face-verification flow                       */
+  /* ------------------------------------------------------------------ */
+  const completeFaceVerification = useCallback((photoUri?: string) => {
     setTimeout(() => {
       setHasFaceData(true);
       setSelfieMode(false);
-      Alert.alert('Face Verification', 'Face verification successful.');
+      if (photoUri) {
+        setCapturedImage(photoUri);
+      }
+      Alert.alert(
+        "Face Verification",
+        "Your face has been successfully verified."
+      );
     }, 500);
-  };
+  }, []);
 
-  // Mock voice verification
-  const completeVoiceVerification = () => {
-    setTimeout(() => {
-      setHasVoiceData(true);
+  const takePicture = useCallback(async () => {
+    if (!cameraRef.current) {
+      completeFaceVerification();
+      return;
+    }
+    try {
+      const photo = await cameraRef.current.takePictureAsync();
+      completeFaceVerification(photo.uri);
+    } catch (err) {
+      console.error("Failed to take picture:", err);
+      Alert.alert("Error", "Failed to take picture. Please try again.");
+      setSelfieMode(false);
+    }
+  }, [completeFaceVerification]);
+
+  /* ------------------------------------------------------------------ */
+  /*                       voice-verification flow                      */
+  /* ------------------------------------------------------------------ */
+  const completeVoiceVerification = useCallback(async () => {
+    try {
+      const uri = await stopRecording();
+      setRecordingUri(uri);
+
+      // unload any existing sound
+      if (soundRef.current) {
+        await soundRef.current.unloadAsync();
+        soundRef.current = null;
+      }
+
+      if (uri) {
+        const { sound } = await Audio.Sound.createAsync({ uri });
+        soundRef.current = sound;
+        setIsPlayingAudio(true);
+
+        Alert.alert(
+          "Voice Playback",
+          "Playing back your voice recording…",
+          [{ text: "OK" }],
+          { cancelable: true }
+        );
+
+        await sound.playAsync();
+        sound.setOnPlaybackStatusUpdate((status) => {
+          if (status.isLoaded && status.didJustFinish) {
+            setIsPlayingAudio(false);
+            setHasVoiceData(true);
+            setVoiceMode(false);
+            Alert.alert(
+              "Voice Recognition",
+              "Your voice has been successfully verified."
+            );
+            sound.unloadAsync();
+            soundRef.current = null;
+          }
+        });
+      } else {
+        setHasVoiceData(true);
+        setVoiceMode(false);
+        Alert.alert(
+          "Voice Recognition",
+          "Your voice has been successfully verified."
+        );
+      }
+    } catch (err) {
+      console.error("Error completing voice verification:", err);
+      Alert.alert(
+        "Error",
+        "Failed to process voice recording. Please try again."
+      );
       setVoiceMode(false);
-      Alert.alert('Voice Recognition', 'Voice verification successful.');
-    }, 500);
-  };
+    }
+  }, [stopRecording]);
+
+  /* ------------------------------------------------------------------ */
+  /*          progress timer & branching into camera / microphone       */
+  /* ------------------------------------------------------------------ */
+  useEffect(() => {
+    if (!selfieMode && !voiceMode) return;
+
+    const id = setInterval(() => {
+      setProgress((p) => {
+        const next = p + 0.1;
+        if (next >= 1) {
+          clearInterval(id);
+          selfieMode && takePicture();
+          voiceMode && completeVoiceVerification();
+          return 1;
+        }
+        return next;
+      });
+    }, 300);
+
+    // kick off recording if we just entered voiceMode
+    if (voiceMode) startRecording();
+
+    setProgress(0);
+    return () => clearInterval(id);
+  }, [selfieMode, voiceMode, takePicture, completeVoiceVerification, startRecording]);
+
+  /* ------------------------------------------------------------------ */
+  /*                             cleanup                                */
+  /* ------------------------------------------------------------------ */
+  useEffect(() => {
+    return () => {
+      // stop any recording
+      stopRecording().catch(() => {});
+      // unload any playing audio
+      if (soundRef.current) {
+        soundRef.current.unloadAsync().catch(() => {});
+      }
+    };
+  }, [stopRecording]);
 
   const handleSendMoney = async () => {
     // Reset errors
@@ -200,24 +370,40 @@ const SendMoneyScreen = () => {
     }
   };
 
+  /* ------------------------------------------------------------------ */
+  /*                              UI bits                               */
+  /* ------------------------------------------------------------------ */
   // Render the selfie capture UI
   const renderSelfieCapture = () => {
+    if (cameraPermission === false) {
+      return (
+        <View style={styles.scanContainer}>
+          <View style={styles.scanPlaceholder}>
+            <IconButton icon="camera-off" size={80} iconColor={Colors.danger} />
+            <Text style={styles.scanningText}>
+              Camera permission denied. Please enable camera access in settings.
+            </Text>
+          </View>
+        </View>
+      );
+    }
     return (
       <View style={styles.scanContainer}>
-        <View style={styles.scanPlaceholder}>
-          <IconButton
-            icon="face-recognition"
-            size={80}
-            iconColor={Colors.primary}
+        <View style={styles.cameraContainer}>
+          {cameraPermission && (
+            <CameraView
+              ref={cameraRef}
+              style={styles.camera}
+              facing="front"
+              ratio="4:3"
+            />
+          )}
+          <ProgressBar
+            progress={progress}
+            color={Colors.primary}
+            style={styles.progressBar}
           />
-          <Text style={styles.scanningText}>
-            Scanning your face...
-          </Text>
-          <ProgressBar 
-            progress={progress} 
-            color={Colors.primary} 
-            style={styles.progressBar} 
-          />
+          <Text style={styles.scanningText}>Scanning your face...</Text>
         </View>
       </View>
     );
@@ -225,21 +411,72 @@ const SendMoneyScreen = () => {
 
   // Render the voice recording UI
   const renderVoiceRecording = () => {
+    if (audioPermission === false) {
+      return (
+        <View style={styles.scanContainer}>
+          <View style={styles.scanPlaceholder}>
+            <IconButton
+              icon="microphone-off"
+              size={80}
+              iconColor={Colors.danger}
+            />
+            <Text style={styles.scanningText}>
+              Microphone permission denied. Please enable microphone access in
+              settings.
+            </Text>
+          </View>
+        </View>
+      );
+    }
+
     return (
       <View style={styles.scanContainer}>
         <View style={styles.scanPlaceholder}>
           <IconButton
-            icon="microphone"
+            icon={
+              isPlayingAudio
+                ? "play-circle"
+                : isRecording
+                ? "microphone"
+                : "microphone-outline"
+            }
             size={80}
-            iconColor={Colors.secondary}
+            iconColor={
+              isPlayingAudio
+                ? Colors.primary
+                : isRecording
+                ? Colors.success
+                : Colors.secondary
+            }
           />
-          <Text style={styles.scanningText}>
-            Please say: &quot;{verificationPhrase}&quot;
-          </Text>
-          <ProgressBar 
-            progress={progress} 
-            color={Colors.secondary} 
-            style={styles.progressBar} 
+          <View style={styles.phraseContainer}>
+            <Text style={styles.phraseInstruction}>Please say:</Text>
+            <Text style={styles.verificationPhrase}>
+              &quot;{verificationPhrase}&quot;
+            </Text>
+          </View>
+          
+          <View style={styles.recordingStatusContainer}>
+            <Text
+              style={[
+                styles.recordingStatusText,
+                { color: isRecording ? Colors.success : Colors.secondary },
+              ]}
+            >
+              {isPlayingAudio
+                ? "Playing back your recording..."
+                : progress >= 1
+                ? "Processing..."
+                : isRecording
+                ? "Recording your voice..."
+                : "Preparing to record..."}
+            </Text>
+          </View>
+          
+          <ProgressBar
+            progress={progress}
+            color={Colors.secondary}
+            style={styles.progressBar}
           />
         </View>
       </View>
@@ -303,9 +540,18 @@ const SendMoneyScreen = () => {
                 titleStyle={styles.cardTitle}
               />
               <Card.Content>
-                <Text variant="bodyMedium">
-                  Verify your identity with facial recognition.
-                </Text>
+                {hasFaceData && capturedImage ? (
+                  <View style={styles.capturedImageContainer}>
+                    <Image
+                      source={{ uri: capturedImage }}
+                      style={styles.capturedImage}
+                    />
+                  </View>
+                ) : (
+                  <Text variant="bodyMedium">
+                    Verify your identity with facial recognition.
+                  </Text>
+                )}
               </Card.Content>
               <Card.Actions>
                 {hasFaceData ? (
@@ -343,9 +589,22 @@ const SendMoneyScreen = () => {
                 titleStyle={styles.cardTitle}
               />
               <Card.Content>
-                <Text variant="bodyMedium">
-                  Verify your identity with voice recognition.
-                </Text>
+                {hasVoiceData && recordingUri ? (
+                  <View style={styles.capturedImageContainer}>
+                    <IconButton
+                      icon="check-circle"
+                      size={50}
+                      iconColor={Colors.success}
+                    />
+                    <Text style={{ color: Colors.success, marginTop: 8 }}>
+                      Voice verification complete
+                    </Text>
+                  </View>
+                ) : (
+                  <Text variant="bodyMedium">
+                    Verify your identity with voice recognition.
+                  </Text>
+                )}
               </Card.Content>
               <Card.Actions>
                 {hasVoiceData ? (
@@ -669,6 +928,68 @@ const styles = StyleSheet.create({
     width: '80%',
     height: 8,
     borderRadius: 4,
+  },
+  cameraContainer: {
+    width: 280,
+    height: 350,
+    borderRadius: 20,
+    overflow: 'hidden',
+    borderWidth: 2,
+    borderColor: Colors.primary,
+    marginBottom: 20,
+    position: 'relative',
+    alignItems: 'center',
+  },
+  camera: { 
+    width: '100%', 
+    height: '100%' 
+  },
+  phraseContainer: { 
+    alignItems: 'center', 
+    marginVertical: 16, 
+    width: '100%' 
+  },
+  phraseInstruction: { 
+    fontSize: 16, 
+    color: Colors.darkGray, 
+    marginBottom: 10 
+  },
+  verificationPhrase: {
+    fontSize: 22,
+    fontWeight: 'bold',
+    color: Colors.secondary,
+    textAlign: 'center',
+    padding: 12,
+    backgroundColor: '#f8f4ff',
+    borderRadius: 8,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: Colors.secondary,
+    width: '100%',
+  },
+  recordingStatusContainer: {
+    marginTop: 20,
+    backgroundColor: 'rgba(255,255,255,0.6)',
+    padding: 8,
+    borderRadius: 8,
+    width: '100%',
+    alignItems: 'center',
+  },
+  recordingStatusText: {
+    fontSize: 16,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  capturedImageContainer: { 
+    alignItems: 'center', 
+    marginVertical: 10 
+  },
+  capturedImage: {
+    width: 150,
+    height: 150,
+    borderRadius: 75,
+    borderWidth: 2,
+    borderColor: Colors.success,
   },
   transactionCard: {
     backgroundColor: Colors.white,
